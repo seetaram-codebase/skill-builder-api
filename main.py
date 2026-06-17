@@ -151,6 +151,35 @@ async def get_skill(draft_id: str):
     )
 
 
+@app.get("/skills/{draft_id}/files/{file_path:path}")
+async def get_skill_file(draft_id: str, file_path: str):
+    """Get the raw content of a single file within a skill draft.
+
+    Examples:
+      GET /skills/{draft_id}/files/SKILL.md
+      GET /skills/{draft_id}/files/references/REFERENCE.md
+      GET /skills/{draft_id}/files/scripts/run.py
+      GET /skills/{draft_id}/files/assets/template.md
+    """
+    if draft_id not in draft_registry:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    skill_dir = draft_registry[draft_id]["skill_path"]
+    full_path = os.path.normpath(os.path.join(skill_dir, file_path))
+
+    # Prevent path traversal
+    if not full_path.startswith(os.path.abspath(skill_dir)):
+        raise HTTPException(status_code=400, detail="Invalid file path")
+
+    if not os.path.isfile(full_path):
+        raise HTTPException(status_code=404, detail=f"File '{file_path}' not found in skill")
+
+    with open(full_path) as f:
+        content = f.read()
+
+    return {"file_path": file_path, "content": content}
+
+
 @app.get("/skills")
 async def list_skills():
     """List all generated skill drafts."""
