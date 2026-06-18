@@ -136,18 +136,30 @@ async def chat_stream(req: ChatRequest):
             if reply_text:
                 yield sse("token", {"text": reply_text})
 
-            # Save draft and emit file contents if agent produced a skill this turn
+            # Save draft and stream each file separately as it's saved
             draft_id = None
             blocks = ag.parse_skill_blocks(raw_reply)
             if blocks and any(f == "skill.md" for f, _ in blocks):
                 try:
                     result = save_skill_from_output(raw_reply, req.skill_name)
                     draft_id = result["draft_id"]
+
+                    total = len(result["files_created"])
+                    for index, (filename, content) in enumerate(result["files"].items()):
+                        yield sse("file", {
+                            "draft_id": draft_id,
+                            "skill_name": result["skill_name"],
+                            "name": filename,
+                            "content": content,
+                            "index": index,
+                            "total": total,
+                        })
+
+                    # Final draft event — signals all files have been sent
                     yield sse("draft", {
                         "draft_id": draft_id,
                         "skill_name": result["skill_name"],
                         "files_created": result["files_created"],
-                        "files": result["files"],
                     })
                 except SkillParseError as e:
                     yield sse("error", {"detail": str(e)}, role="system", is_last=True)
