@@ -51,8 +51,17 @@ class DraftResponse(BaseModel):
 
 # ── SSE helper ────────────────────────────────────────────────────────────────
 
-def sse(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+def sse(event: str, data: dict, *, role: str = "assistant", is_last: bool = False) -> str:
+    """Format a server-sent event with standard envelope fields.
+
+    Every event includes:
+      event      — event type (status, token, draft, done, error)
+      role       — who produced it: "assistant" | "system"
+      is_last    — true on the final event of a turn (done or error)
+      data       — event-specific payload
+    """
+    payload = {"role": role, "is_last": is_last, **data}
+    return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
 
 
 def extract_reply_text(raw: str) -> str:
@@ -104,7 +113,7 @@ async def chat_stream(req: ChatRequest):
             yield sse("status", {
                 "message": "New conversation started" if is_new else "Continuing conversation",
                 "conversation_id": sid,
-            })
+            }, role="system")
 
             message = types.Content(
                 role="user",
@@ -114,7 +123,7 @@ async def chat_stream(req: ChatRequest):
             raw_reply = ""
             async for event in ag.runner.run_async(
                 user_id=sid,
-                conversation_id=adk_conversation_id,
+                session_id=adk_conversation_id,
                 new_message=message,
             ):
                 if event.is_final_response() and event.content:
@@ -138,16 +147,16 @@ async def chat_stream(req: ChatRequest):
                         "draft_id": draft_id,
                         "skill_name": result["skill_name"],
                         "files_created": result["files_created"],
-                        "files": result["files"],   # full content per file for UI preview
+                        "files": result["files"],
                     })
                 except SkillParseError as e:
-                    yield sse("error", {"detail": str(e)})
+                    yield sse("error", {"detail": str(e)}, role="system", is_last=True)
                     return
 
-            yield sse("done", {"conversation_id": sid, "draft_id": draft_id})
+            yield sse("done", {"conversation_id": sid, "draft_id": draft_id}, role="system", is_last=True)
 
         except Exception as e:
-            yield sse("error", {"detail": str(e)})
+            yield sse("error", {"detail": str(e)}, role="system", is_last=True)
 
     return StreamingResponse(
         stream(),
