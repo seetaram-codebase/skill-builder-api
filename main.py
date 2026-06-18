@@ -1,8 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional
-import uuid, os, re, zipfile, io
+from typing import Optional, AsyncGenerator
+import uuid, os, re, zipfile, io, json
 
 from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
@@ -135,6 +135,107 @@ async def create_skill(req: CreateSkillRequest):
         skill_name=skill_name,
         skill_path=skill_dir,
         files_created=files_created,
+    )
+
+
+def sse(event: str, data: dict) -> str:
+    """Format a server-sent event."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.post("/skills/stream")
+async def create_skill_stream(req: CreateSkillRequest):
+    """Stream skill creation progress as Server-Sent Events.
+
+    Events emitted:
+      status   — progress updates (thinking, generating, saving)
+      token    — partial text as the agent streams output
+      file     — each file saved to disk: {name, path}
+      done     — final summary: {draft_id, skill_name, files_created}
+      error    — if something goes wrong: {detail}
+    """
+    async def event_stream() -> AsyncGenerator[str, None]:
+        try:
+            yield sse("status", {"message": "Starting skill creation..."})
+
+            session = await session_service.create_session(
+                app_name="skill-creator-api",
+                user_id="skill-creator",
+            )
+
+            message = types.Content(
+                role="user",
+                parts=[types.Part(text=f"Create a complete skill for: {req.intent}")]
+            )
+
+            yield sse("status", {"message": "Agent thinking..."})
+
+            raw_output = ""
+            async for event in runner.run_async(
+                user_id="skill-creator",
+                session_id=session.id,
+                new_message=message,
+            ):
+                # Stream partial text tokens as they arrive
+                if hasattr(event, "content") and event.content:
+                    for part in event.content.parts:
+                        if part.text and not event.is_final_response():
+                            yield sse("token", {"text": part.text})
+
+                if event.is_final_response() and event.content:
+                    for part in event.content.parts:
+                        if part.text:
+                            raw_output += part.text
+
+            yield sse("status", {"message": "Parsing and saving files..."})
+
+            blocks = re.findall(r"```(\S+)\n(.*?)```", raw_output, re.DOTALL)
+            if not blocks:
+                yield sse("error", {"detail": "Agent did not produce any skill files"})
+                return
+
+            skill_md_content = next((c for f, c in blocks if f == "skill.md"), None)
+            if not skill_md_content:
+                yield sse("error", {"detail": "Agent did not produce SKILL.md"})
+                return
+
+            name_match = re.search(r"^name:\s*(.+)$", skill_md_content, re.MULTILINE)
+            skill_name = req.name or (name_match.group(1).strip() if name_match else str(uuid.uuid4())[:8])
+            skill_dir = os.path.join(SKILLS_OUTPUT_DIR, skill_name)
+
+            files_created = []
+            for fname, content in blocks:
+                target = "SKILL.md" if fname == "skill.md" else fname
+                file_path = os.path.join(skill_dir, target)
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                with open(file_path, "w") as f:
+                    f.write(content.strip())
+                files_created.append(target)
+                yield sse("file", {"name": target, "path": file_path})
+
+            draft_id = str(uuid.uuid4())
+            draft_registry[draft_id] = {
+                "skill_name": skill_name,
+                "skill_path": skill_dir,
+                "files": {f: open(os.path.join(skill_dir, f)).read() for f in files_created},
+            }
+
+            yield sse("done", {
+                "draft_id": draft_id,
+                "skill_name": skill_name,
+                "files_created": files_created,
+            })
+
+        except Exception as e:
+            yield sse("error", {"detail": str(e)})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable nginx buffering
+        },
     )
 
 
